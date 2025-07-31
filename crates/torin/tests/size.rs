@@ -268,7 +268,6 @@ pub fn two_cols_auto() {
 }
 
 #[test]
-#[ignore = "Incorrect behavior, fix in PR"]
 pub fn sibling_increments_area() {
     let (mut layout, mut measurer) = test_utils();
 
