@@ -41,6 +41,12 @@ pub struct MeasuringData<Key: NodeKey> {
     child_sizes: FxHashMap<Key, Size2D>,
 }
 
+pub struct ChildMetadata<Key: NodeKey> {
+    first_child: Option<Key>,
+    last_child: Option<Key>,
+    non_absolute_children_len: usize,
+}
+
 pub struct MeasureContext<'a, Key, L, D>
 where
     Key: NodeKey,
@@ -248,8 +254,8 @@ where
                 &area_size,
                 &self.layout_metadata.root_area,
             );
-            let mut area = Rect::new(area_origin, area_size);
-            let mut inner_area = Rect::new(area_origin, inner_size)
+            let area = Rect::new(area_origin, area_size);
+            let inner_area = Rect::new(area_origin, inner_size)
                 .without_gaps(&node.padding)
                 .without_gaps(&node.margin);
 
@@ -267,17 +273,26 @@ where
                     .available_area
                     .move_with_offsets(&node.offset_x, &node.offset_y);
 
-                let (non_absolute_children_len, first_child, last_child) =
-                    self.first_and_last_child(&node_id, node);
+                let child_metadata = self.first_and_last_child(&node_id, node);
 
                 let (needs_initial_phase, initial_phase_measuring_data) = self
                     .initial_phase_measure_children(
                         &node_id,
                         node,
                         measuring_data.clone(),
-                        last_child,
+                        child_metadata.last_child,
                         true,
                     );
+
+                measuring_data.node_area.origin = node.position.get_origin(
+                    available_parent_area,
+                    parent_area,
+                    &initial_phase_measuring_data.node_area.size,
+                    &self.layout_metadata.root_area,
+                );
+                measuring_data.inner_area = Rect::new(measuring_data.node_area.origin, inner_size)
+                    .without_gaps(&node.padding)
+                    .without_gaps(&node.margin);
 
                 // Measure the layout of this Node's children
                 measuring_data = self.measure_children(
@@ -288,9 +303,7 @@ where
                     must_cache_children,
                     true,
                     needs_initial_phase,
-                    first_child,
-                    last_child,
-                    non_absolute_children_len,
+                    child_metadata,
                 );
 
                 // Re apply min max values after measurin with inner sized
@@ -346,13 +359,13 @@ where
 
             (must_cache_children, layout_node)
         } else {
-            let mut layout_node = self.layout.get(node_id).unwrap().clone();
+            let layout_node = self.layout.get(node_id).unwrap().clone();
 
             let mut measuring_data = MeasuringData {
-                inner_sizes: Size2D::default(),
-                available_area: layout_node.inner_area,
                 node_area: layout_node.area,
                 inner_area: layout_node.inner_area,
+                inner_sizes: Size2D::default(),
+                available_area: layout_node.inner_area,
                 flex_grows: FxHashMap::default(),
                 child_sizes: FxHashMap::default(),
             };
@@ -368,20 +381,19 @@ where
             };
 
             if measure_inner_children {
-                let (non_absolute_children_len, first_child, last_child) =
-                    self.first_and_last_child(&node_id, node);
+                let child_metadata = self.first_and_last_child(&node_id, node);
 
                 let (needs_initial_phase, initial_phase_measuring_data) = self
                     .initial_phase_measure_children(
                         &node_id,
                         node,
                         measuring_data.clone(),
-                        last_child,
+                        child_metadata.last_child,
                         false,
                     );
 
                 // Measure the layout of this Node's children
-                measuring_data = self.measure_children(
+                self.measure_children(
                     &node_id,
                     node,
                     measuring_data,
@@ -389,9 +401,7 @@ where
                     must_cache_children,
                     false,
                     needs_initial_phase,
-                    first_child,
-                    last_child,
-                    non_absolute_children_len,
+                    child_metadata,
                 );
             }
 
@@ -403,7 +413,7 @@ where
         &mut self,
         parent_node_id: &Key,
         parent_node: &Node,
-    ) -> (usize, Option<Key>, Option<Key>) {
+    ) -> ChildMetadata<Key> {
         let children = self.dom_adapter.children_of(parent_node_id);
 
         // Used to calculate the spacing and some alignments
@@ -427,13 +437,17 @@ where
                     is_stacked
                 })
                 .count();
-            (len, first_child, last_child)
+            ChildMetadata {
+                first_child,
+                last_child,
+                non_absolute_children_len: len,
+            }
         } else {
-            (
-                children.len(),
-                children.first().copied(),
-                children.last().copied(),
-            )
+            ChildMetadata {
+                first_child: children.first().copied(),
+                last_child: children.last().copied(),
+                non_absolute_children_len: children.len(),
+            }
         }
     }
 
@@ -450,7 +464,9 @@ where
         let needs_initial_phase = parent_node.cross_alignment.is_not_start()
             || parent_node.main_alignment.is_not_start()
             || parent_node.content.is_fit()
-            || parent_node.content.is_flex();
+            || parent_node.content.is_flex()
+            || (parent_node.position.is_absolute()
+                && (parent_node.height.inner_sized() || parent_node.width.inner_sized()));
 
         measuring_data.inner_sizes = Size2D::default();
 
@@ -532,9 +548,7 @@ where
         // Parent Node is dirty.
         parent_is_dirty: bool,
         needs_initial_phase: bool,
-        first_child: Option<Key>,
-        last_child: Option<Key>,
-        non_absolute_children_len: usize,
+        child_metadata: ChildMetadata<Key>,
     ) -> MeasuringData<Key> {
         let children = self.dom_adapter.children_of(parent_node_id);
 
@@ -555,9 +569,10 @@ where
         let flex_available_height =
             initial_available_area.height() - initial_phase_measuring_data.inner_sizes.height;
 
-        let initial_phase_inner_sizes_with_flex = initial_phase_measuring_data.flex_grows.values().fold(
-            initial_phase_measuring_data.inner_sizes,
-            |mut acc, f| {
+        let initial_phase_inner_sizes_with_flex = initial_phase_measuring_data
+            .flex_grows
+            .values()
+            .fold(initial_phase_measuring_data.inner_sizes, |mut acc, f| {
                 let flex_grow_per = f.get() / flex_grows.get() * 100.;
 
                 match flex_axis {
@@ -572,8 +587,7 @@ where
                 }
 
                 acc
-            },
-        );
+            });
 
         if needs_initial_phase {
             if parent_node.main_alignment.is_not_start() {
@@ -617,8 +631,8 @@ where
                 continue;
             };
 
-            let is_first_child = first_child == Some(child_id);
-            let is_last_child = last_child == Some(child_id);
+            let is_first_child = child_metadata.first_child == Some(child_id);
+            let is_last_child = child_metadata.last_child == Some(child_id);
 
             let mut adapted_available_area = measuring_data.available_area.clone();
 
@@ -651,7 +665,7 @@ where
                     initial_phase_inner_sizes_with_flex,
                     &parent_node.main_alignment,
                     &parent_node.direction,
-                    non_absolute_children_len,
+                    child_metadata.non_absolute_children_len,
                     is_first_child,
                 );
             }
