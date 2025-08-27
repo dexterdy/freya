@@ -34,6 +34,24 @@ pub enum Phase {
     Final,
 }
 
+/// - `node_area`: Total area used by the node. Calculated before the child measuring phase. If any
+///   dimension is inner sized, this value is updated during the child measuring phase.
+///
+/// - `inner_area`: Kept in sync with `node_area` but excludes padding and margin. It reflects
+///   the actual space available for child layout inside the parent.
+///
+/// - `inner_sizes`: Accumulates the total width and height occupied by children.
+///
+/// - `available_area`: Accumulator to keep track of available area for child layout.
+///   Is updated continuously during child measuring phase.
+#[derive(Clone)]
+pub struct MeasuringData {
+    node_area: Area,
+    inner_area: Area,
+    inner_sizes: Size2D,
+    available_area: Area,
+}
+
 pub struct MeasureContext<'a, Key, L, D>
 where
     Key: NodeKey,
@@ -246,31 +264,32 @@ where
                 .without_gaps(&node.padding)
                 .without_gaps(&node.margin);
 
-            let mut inner_sizes = Size2D::default();
-
+            let mut measuring_data = MeasuringData {
+                node_area: area,
+                inner_area,
+                inner_sizes: Size2D::default(),
+                available_area: inner_area,
+            };
             if measure_inner_children && phase_measure_inner_children {
                 // Create an area containing the available space inside the inner area
-                let mut available_area = inner_area;
-
-                available_area.move_with_offsets(&node.offset_x, &node.offset_y);
+                measuring_data
+                    .available_area
+                    .move_with_offsets(&node.offset_x, &node.offset_y);
 
                 // Measure the layout of this Node's children
                 self.measure_children(
                     &node_id,
                     node,
-                    &mut available_area,
-                    &mut inner_sizes,
+                    &mut measuring_data,
                     must_cache_children,
-                    &mut area,
-                    &mut inner_area,
                     true,
                 );
 
                 // Re apply min max values after measurin with inner sized
                 // Margins are set to 0 because area.size already contains the margins
                 if node.width.inner_sized() {
-                    area.size.width = node.width.min_max(
-                        area.size.width,
+                    measuring_data.node_area.size.width = node.width.min_max(
+                        measuring_data.node_area.size.width,
                         parent_area.size.width,
                         available_parent_area.size.width,
                         0.,
@@ -282,8 +301,8 @@ where
                     );
                 }
                 if node.height.inner_sized() {
-                    area.size.height = node.height.min_max(
-                        area.size.height,
+                    measuring_data.node_area.size.height = node.height.min_max(
+                        measuring_data.node_area.size.height,
                         parent_area.size.height,
                         available_parent_area.size.height,
                         0.,
@@ -296,33 +315,41 @@ where
                 }
             }
 
-            inner_sizes.width += node.padding.horizontal();
-            inner_sizes.height += node.padding.vertical();
+            measuring_data.inner_sizes.width += node.padding.horizontal();
+            measuring_data.inner_sizes.height += node.padding.vertical();
 
             let layout_node = LayoutNode {
-                area,
+                area: measuring_data.node_area,
                 margin: node.margin,
-                inner_area,
+                inner_area: measuring_data.inner_area,
                 data: node_data,
             };
 
             // In case of any layout listener, notify it with the new areas.
             if node.has_layout_references {
                 if let Some(measurer) = self.measurer {
-                    measurer.notify_layout_references(node_id, layout_node.area, inner_sizes);
+                    measurer.notify_layout_references(
+                        node_id,
+                        layout_node.area,
+                        measuring_data.inner_sizes,
+                    );
                 }
             }
 
             (must_cache_children, layout_node)
         } else {
-            let layout_node = self.layout.get(node_id).unwrap().clone();
+            let mut layout_node = self.layout.get(node_id).unwrap().clone();
 
-            let mut inner_sizes = Size2D::default();
-            let mut available_area = layout_node.inner_area;
-            let mut area = layout_node.area;
-            let mut inner_area = layout_node.inner_area;
+            let mut measuring_data = MeasuringData {
+                inner_sizes: Size2D::default(),
+                available_area: layout_node.inner_area,
+                node_area: layout_node.area,
+                inner_area: layout_node.inner_area,
+            };
 
-            available_area.move_with_offsets(&node.offset_x, &node.offset_y);
+            measuring_data
+                .available_area
+                .move_with_offsets(&node.offset_x, &node.offset_y);
 
             let measure_inner_children = if let Some(measurer) = self.measurer {
                 measurer.should_measure_inner_children(node_id)
@@ -334,11 +361,8 @@ where
                 self.measure_children(
                     &node_id,
                     node,
-                    &mut available_area,
-                    &mut inner_sizes,
+                    &mut measuring_data,
                     must_cache_children,
-                    &mut area,
-                    &mut inner_area,
                     false,
                 );
             }
@@ -353,24 +377,14 @@ where
         &mut self,
         parent_node_id: &Key,
         parent_node: &Node,
-        // Area available inside the Node
-        available_area: &mut Area,
-        // Accumulated sizes in both axis in the Node
-        inner_sizes: &mut Size2D,
+        // Area's and sizes
+        measuring_data: &mut MeasuringData,
         // Whether to cache the measurements of this Node's children
         must_cache_children: bool,
-        // Parent area.
-        area: &mut Area,
-        // Inner area of the parent.
-        inner_area: &mut Area,
         // Parent Node is dirty.
         parent_is_dirty: bool,
     ) {
         let children = self.dom_adapter.children_of(parent_node_id);
-
-        let mut initial_phase_flex_grows = FxHashMap::default();
-        let mut initial_phase_sizes = FxHashMap::default();
-        let mut initial_phase_inner_sizes = Size2D::default();
 
         // Used to calculate the spacing and some alignments
         let (non_absolute_children_len, first_child, last_child) = if parent_node.spacing.get() > 0.
@@ -408,9 +422,10 @@ where
             || parent_node.content.is_fit()
             || parent_node.content.is_flex();
 
-        let mut initial_phase_area = *area;
-        let mut initial_phase_inner_area = *inner_area;
-        let mut initial_phase_available_area = *available_area;
+        let mut initial_phase_measuring_data = measuring_data.clone();
+        initial_phase_measuring_data.inner_sizes = Size2D::default();
+        let mut initial_phase_flex_grows = FxHashMap::default();
+        let mut initial_phase_sizes = FxHashMap::default();
 
         // Initial phase: Measure the size and position of the children if the parent has a
         // non-start cross alignment, non-start main aligment of a fit-content.
@@ -429,13 +444,11 @@ where
 
                 let is_last_child = last_child == Some(*child_id);
 
-                let inner_area = initial_phase_inner_area;
-
                 let (_, mut child_areas) = self.measure_node(
                     *child_id,
                     &child_data,
-                    &inner_area,
-                    &initial_phase_available_area,
+                    &initial_phase_measuring_data.inner_area,
+                    &initial_phase_measuring_data.available_area,
                     false,
                     parent_is_dirty,
                     Phase::Initial,
@@ -445,12 +458,9 @@ where
 
                 // Stack this child into the parent
                 Self::stack_child(
-                    &mut initial_phase_available_area,
                     parent_node,
                     &child_data,
-                    &mut initial_phase_area,
-                    &mut initial_phase_inner_area,
-                    &mut initial_phase_inner_sizes,
+                    &mut initial_phase_measuring_data,
                     &child_areas.area,
                     is_last_child,
                     Phase::Initial,
@@ -479,7 +489,7 @@ where
             }
         }
 
-        let initial_available_area = *available_area;
+        let initial_available_area = measuring_data.available_area.clone();
 
         let flex_grows = initial_phase_flex_grows
             .values()
@@ -490,45 +500,46 @@ where
 
         let flex_axis = AlignAxis::new(&parent_node.direction, AlignmentDirection::Main);
 
-        let flex_available_width = initial_available_area.width() - initial_phase_inner_sizes.width;
+        let flex_available_width =
+            initial_available_area.width() - initial_phase_measuring_data.inner_sizes.width;
         let flex_available_height =
-            initial_available_area.height() - initial_phase_inner_sizes.height;
+            initial_available_area.height() - initial_phase_measuring_data.inner_sizes.height;
 
-        let initial_phase_inner_sizes_with_flex =
-            initial_phase_flex_grows
-                .values()
-                .fold(initial_phase_inner_sizes, |mut acc, f| {
-                    let flex_grow_per = f.get() / flex_grows.get() * 100.;
+        let initial_phase_inner_sizes_with_flex = initial_phase_flex_grows.values().fold(
+            initial_phase_measuring_data.inner_sizes,
+            |mut acc, f| {
+                let flex_grow_per = f.get() / flex_grows.get() * 100.;
 
-                    match flex_axis {
-                        AlignAxis::Height => {
-                            let size = flex_available_height / 100. * flex_grow_per;
-                            acc.height += size;
-                        }
-                        AlignAxis::Width => {
-                            let size = flex_available_width / 100. * flex_grow_per;
-                            acc.width += size;
-                        }
+                match flex_axis {
+                    AlignAxis::Height => {
+                        let size = flex_available_height / 100. * flex_grow_per;
+                        acc.height += size;
                     }
+                    AlignAxis::Width => {
+                        let size = flex_available_width / 100. * flex_grow_per;
+                        acc.width += size;
+                    }
+                }
 
-                    acc
-                });
+                acc
+            },
+        );
 
         if needs_initial_phase {
             if parent_node.main_alignment.is_not_start() {
                 // Adjust the available and inner areas of the Main axis
                 Self::shrink_area_to_fit_when_unbounded(
-                    available_area,
-                    &initial_phase_area,
-                    &mut initial_phase_inner_area,
+                    &mut measuring_data.available_area,
+                    &initial_phase_measuring_data.node_area,
+                    &mut initial_phase_measuring_data.inner_area,
                     parent_node,
                     AlignmentDirection::Main,
                 );
 
                 // Align the Main axis
                 Self::align_content(
-                    available_area,
-                    &initial_phase_inner_area,
+                    &mut measuring_data.available_area,
+                    &initial_phase_measuring_data.inner_area,
                     initial_phase_inner_sizes_with_flex,
                     &parent_node.main_alignment,
                     &parent_node.direction,
@@ -539,16 +550,16 @@ where
             if parent_node.cross_alignment.is_not_start() || parent_node.content.is_fit() {
                 // Adjust the available and inner areas of the Cross axis
                 Self::shrink_area_to_fit_when_unbounded(
-                    available_area,
-                    &initial_phase_area,
-                    &mut initial_phase_inner_area,
+                    &mut measuring_data.available_area,
+                    &initial_phase_measuring_data.node_area,
+                    &mut initial_phase_measuring_data.inner_area,
                     parent_node,
                     AlignmentDirection::Cross,
                 );
             }
         }
 
-        let initial_available_area = *available_area;
+        let initial_available_area = measuring_data.available_area.clone();
 
         // Final phase: measure the children with all the axis and sizes adjusted
         for child_id in children {
@@ -559,7 +570,7 @@ where
             let is_first_child = first_child == Some(child_id);
             let is_last_child = last_child == Some(child_id);
 
-            let mut adapted_available_area = *available_area;
+            let mut adapted_available_area = measuring_data.available_area.clone();
 
             if parent_node.content.is_flex() {
                 let flex_grow = initial_phase_flex_grows.get(&child_id);
@@ -602,7 +613,7 @@ where
                     // Align the Cross axis if necessary
                     Self::align_content(
                         &mut adapted_available_area,
-                        available_area,
+                        &measuring_data.available_area,
                         *initial_phase_size,
                         &parent_node.cross_alignment,
                         &parent_node.direction,
@@ -615,7 +626,7 @@ where
             let (child_revalidated, mut child_areas) = self.measure_node(
                 child_id,
                 &child_data,
-                inner_area,
+                &measuring_data.inner_area,
                 &adapted_available_area,
                 must_cache_children,
                 parent_is_dirty,
@@ -628,12 +639,9 @@ where
             // Stack this child into the parent
             if child_data.position.is_stacked() {
                 Self::stack_child(
-                    available_area,
                     parent_node,
                     &child_data,
-                    area,
-                    inner_area,
-                    inner_sizes,
+                    measuring_data,
                     &child_areas.area,
                     is_last_child,
                     Phase::Final,
@@ -750,12 +758,9 @@ where
     /// Stack a child Node into its parent
     #[allow(clippy::too_many_arguments)]
     fn stack_child(
-        available_area: &mut Area,
         parent_node: &Node,
         child_node: &Node,
-        parent_area: &mut Area,
-        inner_area: &mut Area,
-        inner_sizes: &mut Size2D,
+        measuring_data: &mut MeasuringData,
         child_area: &Area,
         is_last_sibiling: bool,
         phase: Phase,
@@ -768,60 +773,63 @@ where
         match parent_node.direction {
             Direction::Horizontal => {
                 // Move the available area
-                available_area.origin.x = child_area.max_x() + spacing.get();
-                available_area.size.width -= child_area.size.width + spacing.get();
+                measuring_data.available_area.origin.x = child_area.max_x() + spacing.get();
+                measuring_data.available_area.size.width -= child_area.size.width + spacing.get();
 
-                inner_sizes.height = child_area.height().max(inner_sizes.height);
-                inner_sizes.width += spacing.get();
+                measuring_data.inner_sizes.height =
+                    child_area.height().max(measuring_data.inner_sizes.height);
+                measuring_data.inner_sizes.width += spacing.get();
                 if !child_node.width.is_flex() || phase == Phase::Final {
-                    inner_sizes.width += child_area.width();
+                    measuring_data.inner_sizes.width += child_area.width();
                 }
 
                 // Keep the biggest height
                 if parent_node.height.inner_sized() {
-                    parent_area.size.height = parent_area.size.height.max(
-                        child_area.size.height
-                            + parent_node.padding.vertical()
-                            + parent_node.margin.vertical(),
-                    );
+                    measuring_data.node_area.size.height =
+                        measuring_data.node_area.size.height.max(
+                            child_area.size.height
+                                + parent_node.padding.vertical()
+                                + parent_node.margin.vertical(),
+                        );
                     // Keep the inner area in sync
-                    inner_area.size.height = parent_area.size.height
+                    measuring_data.inner_area.size.height = measuring_data.node_area.size.height
                         - parent_node.padding.vertical()
                         - parent_node.margin.vertical();
                 }
 
                 // Accumulate width
                 if parent_node.width.inner_sized() {
-                    parent_area.size.width += child_area.size.width + spacing.get();
+                    measuring_data.node_area.size.width += child_area.size.width + spacing.get();
                 }
             }
             Direction::Vertical => {
                 // Move the available area
-                available_area.origin.y = child_area.max_y() + spacing.get();
-                available_area.size.height -= child_area.size.height + spacing.get();
+                measuring_data.available_area.origin.y = child_area.max_y() + spacing.get();
+                measuring_data.available_area.size.height -= child_area.size.height + spacing.get();
 
-                inner_sizes.width = child_area.width().max(inner_sizes.width);
-                inner_sizes.height += spacing.get();
+                measuring_data.inner_sizes.width =
+                    child_area.width().max(measuring_data.inner_sizes.width);
+                measuring_data.inner_sizes.height += spacing.get();
                 if !child_node.height.is_flex() || phase == Phase::Final {
-                    inner_sizes.height += child_area.height();
+                    measuring_data.inner_sizes.height += child_area.height();
                 }
 
                 // Keep the biggest width
                 if parent_node.width.inner_sized() {
-                    parent_area.size.width = parent_area.size.width.max(
+                    measuring_data.node_area.size.width = measuring_data.node_area.size.width.max(
                         child_area.size.width
                             + parent_node.padding.horizontal()
                             + parent_node.margin.horizontal(),
                     );
                     // Keep the inner area in sync
-                    inner_area.size.width = parent_area.size.width
+                    measuring_data.inner_area.size.width = measuring_data.node_area.size.width
                         - parent_node.padding.horizontal()
                         - parent_node.margin.horizontal();
                 }
 
                 // Accumulate height
                 if parent_node.height.inner_sized() {
-                    parent_area.size.height += child_area.size.height + spacing.get();
+                    measuring_data.node_area.size.height += child_area.size.height + spacing.get();
                 }
             }
         }
