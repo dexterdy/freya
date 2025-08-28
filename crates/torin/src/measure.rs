@@ -1,41 +1,22 @@
-use std::{
-    collections::HashMap,
-    mem,
-};
+use std::{collections::HashMap, mem};
 
 pub use euclid::Rect;
-use rustc_hash::{
-    FxBuildHasher,
-    FxHashMap,
-};
+use rustc_hash::{FxBuildHasher, FxHashMap};
 
 use crate::{
     custom_measurer::LayoutMeasurer,
-    dom_adapter::{
-        DOMAdapter,
-        LayoutNode,
-        NodeKey,
-    },
-    geometry::{
-        Area,
-        Size2D,
-    },
+    dom_adapter::{DOMAdapter, LayoutNode, NodeKey},
+    geometry::{Area, Size2D},
     node::Node,
     prelude::{
-        AlignAxis,
-        Alignment,
-        AlignmentDirection,
-        AreaModel,
-        Direction,
-        LayoutMetadata,
-        Length,
+        AlignAxis, Alignment, AlignmentDirection, AreaModel, Direction, LayoutMetadata, Length,
         Torin,
     },
     size::Size,
 };
 
-/// Some layout strategies require two-phase measurements
-/// Example: Alignments or content-fit.
+/// Some layout strategies require two- or three-phase measurements
+/// Example: Alignments, content-fit or wrapping
 #[derive(Clone, Copy, PartialEq)]
 pub enum Phase {
     Initial,
@@ -269,6 +250,9 @@ where
                     &node_id,
                     node,
                     phase,
+                    available_parent_area,
+                    parent_area,
+                    inner_size,
                     &mut available_area,
                     &mut inner_sizes,
                     &mut area,
@@ -346,6 +330,9 @@ where
                     &node_id,
                     node,
                     phase,
+                    available_parent_area,
+                    parent_area,
+                    Size2D::zero(),
                     &mut available_area,
                     &mut inner_sizes,
                     &mut area,
@@ -366,6 +353,9 @@ where
         node_id: &Key,
         node: &Node,
         node_phase: Phase,
+        parent_available_area: &Area,
+        grand_parent_area: &Area,
+        original_inner_size: Size2D,
         // Area available for children inside the Node
         available_area: &mut Area,
         // Accumulated sizes in both axis in the Node
@@ -387,17 +377,19 @@ where
             .filter(|child_id| {
                 self.dom_adapter
                     .get_node(child_id)
-                    .map(|child_data| child_data.position.is_stacked())
-                    .unwrap_or(false)
+                    .is_some_and(|child_data| child_data.position.is_stacked())
             })
             .last()
-            .cloned();
+            .copied();
 
         let needs_initial_phase = node.cross_alignment.is_not_start()
             || node.main_alignment.is_not_start()
             || node.content.is_fit()
             || node.content.is_flex()
-            || node.wrap_content.is_wrap();
+            || node.wrap_content.is_wrap()
+            || (node.position.is_absolute()
+                && (node.width.inner_sized(Phase::Initial)
+                    || node.height.inner_sized(Phase::Initial)));
 
         let initial_available_area = *available_area;
 
@@ -538,6 +530,20 @@ where
                 available_area.size.width = initial_phase_inner_sizes
                     .width
                     .min(available_area.size.width);
+            }
+            if node.position.is_absolute()
+                && (node.width.inner_sized(Phase::Initial)
+                    || node.height.inner_sized(Phase::Initial))
+            {
+                node_area.origin = node.position.get_origin(
+                    parent_available_area,
+                    grand_parent_area,
+                    &initial_phase_area.size,
+                    &self.layout_metadata.root_area,
+                );
+                *inner_area = Rect::new(node_area.origin, original_inner_size)
+                    .without_gaps(&node.padding)
+                    .without_gaps(&node.margin);
             }
         }
 
@@ -959,7 +965,7 @@ where
     /// - `inner_sizes`: Accumulates the total width and height occupied by children.
     ///
     /// - `line_sizes`: Accumulates the width and height of children in the same line. A line is a row
-    ///    or column, depending on the direction of the node. A wrapping node can have multiple lines.
+    ///   or column, depending on the direction of the node. A wrapping node can have multiple lines.
     #[allow(clippy::too_many_arguments)]
     fn stack_child(
         node: &Node,
@@ -981,9 +987,11 @@ where
                 *cur_line_len += 1;
 
                 // Don't apply spacing to last child
-                let spacing = (!is_last_sibling)
-                    .then_some(node.spacing)
-                    .unwrap_or_default();
+                let spacing = if is_last_sibling {
+                    Length::default()
+                } else {
+                    node.spacing
+                };
 
                 // update size of current line
                 cur_line.height = cur_line.height.max(child_area.height());
@@ -1039,9 +1047,11 @@ where
                 *cur_line_len += 1;
 
                 // Don't apply spacing to last child
-                let spacing = (!is_last_sibling)
-                    .then_some(node.spacing)
-                    .unwrap_or_default();
+                let spacing = if is_last_sibling {
+                    Length::default()
+                } else {
+                    node.spacing
+                };
 
                 // update size of current line
                 cur_line.width = cur_line.width.max(child_area.width());
