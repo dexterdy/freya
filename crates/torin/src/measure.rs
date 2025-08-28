@@ -544,6 +544,7 @@ where
                 *inner_area = Rect::new(node_area.origin, original_inner_size)
                     .without_gaps(&node.padding)
                     .without_gaps(&node.margin);
+                available_area.origin = node_area.origin;
             }
         }
 
